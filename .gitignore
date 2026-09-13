@@ -1,0 +1,25 @@
+# Secrets — never commit
+.env
+.env.local
+*.pem
+*.key
+credentials.json
+!.env.example
+config/secrets.*
+
+# Local data — never commit
+data/*
+!data/.gitkeep
+*.csv
+*.xlsx
+*.db
+*.sqlite3
+
+# Node / Vite
+node_modules
+dist
+dist_check
+vite.config.js.timestamp-*
+
+# macOS
+.DS_Store

@@ -1,0 +1,2 @@
+# Add dependencies as they are introduced, pinned to a version.
+# e.g. psycopg2-binary==2.9.9
