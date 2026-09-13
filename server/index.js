@@ -1,4 +1,7 @@
 import 'dotenv/config'
+import fs from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import express from 'express'
 import cors from 'cors'
 import { OAuth2Client } from 'google-auth-library'
@@ -13,6 +16,14 @@ import {
   stats,
 } from './crm.js'
 import { engagement, gokwikStats } from './gokwik.js'
+import {
+  DEV_BYPASS,
+  configProblems,
+  endSession,
+  requireAuth,
+  sessionUser,
+  startSession,
+} from './auth.js'
 
 const PORT = process.env.PORT || 8787
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || ''
@@ -21,9 +32,44 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || ''
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001'
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'http://localhost:5173'
 
+// Vercel loads this file as a function per request (api/index.js) rather than
+// starting it as a server, so there is no port to listen on there.
+const ON_VERCEL = Boolean(process.env.VERCEL)
+
+// A deployed server missing its sign-in settings must never serve data: the
+// alternative is a customer list anyone could read. A long-running server
+// refuses to start. On Vercel there is no start to refuse, so the function
+// stays up but locks every /api route except /api/health, which says what is
+// missing.
+const setupNeeded = configProblems({
+  googleClientId: GOOGLE_CLIENT_ID,
+  allowedEmailDomain: ALLOWED_EMAIL_DOMAIN,
+})
+if (setupNeeded.length && !ON_VERCEL) {
+  console.error('CallDesk backend refusing to start (NODE_ENV=production):')
+  setupNeeded.forEach((problem) => console.error(`  ✗ ${problem}`))
+  process.exit(1)
+}
+
 const app = express()
-app.use(cors({ origin: ALLOWED_ORIGIN }))
+// Behind Render, a load balancer or nginx, the app sees plain HTTP. Trusting the
+// first proxy lets req.secure reflect the real HTTPS connection, which decides
+// whether the session cookie is marked Secure.
+app.set('trust proxy', 1)
+// Only matters when the website is on a different domain from this server;
+// `credentials` lets that site send the session cookie.
+app.use(cors({ origin: ALLOWED_ORIGIN, credentials: true }))
 app.use(express.json({ limit: '200kb' }))
+
+// Locked, including sign-in: without SESSION_SECRET a session cookie could be
+// forged, so no session may be issued until the settings exist.
+if (setupNeeded.length) {
+  app.use('/api', (req, res, next) =>
+    req.path === '/health'
+      ? next()
+      : res.status(503).json({ error: 'This server is not set up yet.', setupNeeded })
+  )
+}
 
 const googleClient = GOOGLE_CLIENT_ID ? new OAuth2Client(GOOGLE_CLIENT_ID) : null
 
@@ -37,6 +83,18 @@ app.get('/api/health', (req, res) => {
     shopifyStore: process.env.SHOPIFY_STORE || null,
     crmConfigured: crmConfigured(),
     allowedEmailDomain: ALLOWED_EMAIL_DOMAIN || null,
+    // Public by design: Google's button needs the client ID in the page anyway.
+    // Serving it here means one setting configures both halves.
+    googleClientId: GOOGLE_CLIENT_ID || null,
+    authMode: setupNeeded.length
+      ? 'unconfigured'
+      : GOOGLE_CLIENT_ID
+        ? 'google'
+        : DEV_BYPASS
+          ? 'dev'
+          : 'unconfigured',
+    // Names of missing settings only, never their values.
+    setupNeeded,
   })
 })
 
@@ -73,17 +131,51 @@ app.post('/api/auth/google', async (req, res) => {
       return res.status(403).json({ error: `Only @${ALLOWED_EMAIL_DOMAIN} accounts can sign in.` })
     }
 
-    res.json({
+    const profile = {
       email: payload.email,
       name: payload.name || payload.email.split('@')[0],
       picture: payload.picture || '',
       googleId: payload.sub,
-    })
+    }
+    startSession(req, res, profile)
+    res.json(profile)
   } catch (err) {
     console.error('Google token verification failed:', err.message)
     res.status(401).json({ error: 'Could not verify Google sign-in — try again.' })
   }
 })
+
+app.get('/api/auth/me', (req, res) => {
+  const user = sessionUser(req)
+  if (!user) return res.status(401).json({ error: 'Not signed in.' })
+  res.json(user)
+})
+
+app.post('/api/auth/logout', (req, res) => {
+  endSession(req, res)
+  res.json({ ok: true })
+})
+
+// Name-only sign-in for local development. Answers 404 unless the server was
+// started with AUTH_DEV_BYPASS=true outside production, so on a deployed server
+// the route behaves as if it does not exist.
+app.post('/api/auth/dev', (req, res) => {
+  if (!DEV_BYPASS) return res.status(404).json({ error: 'Not found' })
+  const name = String(req.body?.name || '').trim().slice(0, 80)
+  const email = String(req.body?.email || '').trim().slice(0, 120)
+  if (!name) return res.status(400).json({ error: 'Enter your name so calls can be attributed to you.' })
+  startSession(req, res, { name, email })
+  res.json({ name, email })
+})
+
+/* ------------------------------------------------------------------ */
+/* Everything below needs a signed-in user                             */
+/*                                                                      */
+/* Customer names, phone numbers, orders and spend, plus the AI routes  */
+/* that cost money per call. Health and the sign-in routes above stay   */
+/* open, because you need them before you have a session.              */
+/* ------------------------------------------------------------------ */
+app.use('/api', requireAuth)
 
 /* ------------------------------------------------------------------ */
 /* AI note extraction                                                  */
@@ -492,10 +584,41 @@ app.get('/api/gokwik/engagement', crmGuard, async (req, res) => {
   }
 })
 
-app.listen(PORT, () => {
-  console.log(`CallDesk backend listening on http://localhost:${PORT}`)
-  if (!GOOGLE_CLIENT_ID) console.warn('  ⚠ GOOGLE_CLIENT_ID not set — Google Sign-In will fail.')
-  if (!ANTHROPIC_API_KEY) console.warn('  ⚠ ANTHROPIC_API_KEY not set — AI extraction will fail.')
-  if (!ALLOWED_EMAIL_DOMAIN) console.warn('  ⚠ ALLOWED_EMAIL_DOMAIN not set — any Google account can sign in.')
-  if (!crmConfigured()) console.warn('  ⚠ CRM_DATABASE not set — CRM endpoints will return 503.')
-})
+// An /api path nothing matched. Answered as JSON so it never falls through to
+// the website's index.html below.
+app.use('/api', (req, res) => res.status(404).json({ error: 'Not found' }))
+
+/* ------------------------------------------------------------------ */
+/* The website itself                                                  */
+/*                                                                      */
+/* After `npm run build`, this server also serves dist/, so one service */
+/* is the whole app: the page and the API share an origin, and the     */
+/* session cookie needs no cross-site settings.                         */
+/* ------------------------------------------------------------------ */
+const DIST = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'dist')
+const SERVES_WEBSITE = fs.existsSync(path.join(DIST, 'index.html'))
+if (SERVES_WEBSITE) {
+  app.use(express.static(DIST))
+  // A single-page app: any other path is still index.html.
+  app.get('*', (req, res) => res.sendFile(path.join(DIST, 'index.html')))
+}
+
+if (!ON_VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`CallDesk backend listening on http://localhost:${PORT}`)
+    console.log(
+      SERVES_WEBSITE
+        ? `  ✓ Serving the website from ${DIST}`
+        : '  · No dist/ build found, so only the API is served (run `npm run build` in the project root).'
+    )
+    if (DEV_BYPASS) {
+      console.warn('  ⚠ AUTH_DEV_BYPASS is on — name-only sign-in is enabled. Never set this on a deployed server.')
+    }
+    if (!GOOGLE_CLIENT_ID) console.warn('  ⚠ GOOGLE_CLIENT_ID not set — Google Sign-In will fail.')
+    if (!ANTHROPIC_API_KEY) console.warn('  ⚠ ANTHROPIC_API_KEY not set — AI extraction will fail.')
+    if (!ALLOWED_EMAIL_DOMAIN) console.warn('  ⚠ ALLOWED_EMAIL_DOMAIN not set — any Google account can sign in.')
+    if (!crmConfigured()) console.warn('  ⚠ CRM_DATABASE not set — CRM endpoints will return 503.')
+  })
+}
+
+export default app

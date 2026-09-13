@@ -1,7 +1,25 @@
-// Single source of truth for where the backend lives. The backend is what
-// verifies Google Sign-In and holds the Anthropic API key — neither can live
-// in browser code, so both AuthContext and extract.js call through here.
-export const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8787'
+// Single source of truth for where the backend lives.
+//
+// Empty by default, meaning "the site this page was loaded from": in
+// production the backend serves the website itself, and in development Vite
+// forwards /api to it (vite.config.js). Set VITE_API_URL only when the website
+// and the backend are hosted on different domains.
+export const API_BASE = import.meta.env.VITE_API_URL || ''
+
+// AuthContext listens for this and returns to the sign-in screen.
+export const UNAUTHORIZED_EVENT = 'calldesk:unauthorized'
+
+/**
+ * Every request to the backend goes through here, so none can forget to send
+ * the session cookie. A 401 means the session expired or never existed.
+ */
+export async function apiFetch(path, options = {}) {
+  const res = await fetch(`${API_BASE}${path}`, { credentials: 'include', ...options })
+  if (res.status === 401 && !path.startsWith('/api/auth/')) {
+    window.dispatchEvent(new Event(UNAUTHORIZED_EVENT))
+  }
+  return res
+}
 
 /**
  * Pulls every callable customer out of the CRM, a page at a time. The browser
@@ -14,7 +32,7 @@ export async function fetchCrmCustomers({ pageSize = 500, onProgress } = {}) {
   let total = 0
 
   do {
-    const res = await fetch(`${API_BASE}/api/crm/customers?limit=${pageSize}&offset=${offset}`)
+    const res = await apiFetch(`/api/crm/customers?limit=${pageSize}&offset=${offset}`)
     if (!res.ok) {
       const body = await res.json().catch(() => ({}))
       throw new Error(body.error || `CRM request failed (${res.status})`)
@@ -35,7 +53,7 @@ export async function fetchCrmCustomers({ pageSize = 500, onProgress } = {}) {
  * server-side, because these numbers are stored in several shapes.
  */
 export async function fetchEngagement(phone, { signal } = {}) {
-  const res = await fetch(`${API_BASE}/api/gokwik/engagement?phone=${encodeURIComponent(phone)}`, {
+  const res = await apiFetch(`/api/gokwik/engagement?phone=${encodeURIComponent(phone)}`, {
     signal,
   })
   if (!res.ok) {
@@ -47,7 +65,7 @@ export async function fetchEngagement(phone, { signal } = {}) {
 
 /** A synced customer's recent Shopify orders, straight from the CRM database. */
 export async function fetchCustomerOrders(sourceId, { signal } = {}) {
-  const res = await fetch(`${API_BASE}/api/crm/customers/${encodeURIComponent(sourceId)}/orders`, {
+  const res = await apiFetch(`/api/crm/customers/${encodeURIComponent(sourceId)}/orders`, {
     signal,
   })
   if (!res.ok) {
@@ -65,9 +83,13 @@ export async function fetchCustomerOrders(sourceId, { signal } = {}) {
 /** What the backend has been given keys for — Shopify handle, AI, Google. */
 let configPromise = null
 export function fetchConfig() {
-  configPromise ||= fetch(`${API_BASE}/api/health`)
+  configPromise ||= apiFetch('/api/health')
     .then((r) => (r.ok ? r.json() : {}))
-    .catch(() => ({}))
+    .catch(() => {
+      // Don't remember a failure: the server may simply not be up yet.
+      configPromise = null
+      return {}
+    })
   return configPromise
 }
 
@@ -78,7 +100,7 @@ export function shopifyCustomerUrl(store, sourceId) {
 }
 
 async function getJson(path, { signal } = {}) {
-  const res = await fetch(`${API_BASE}${path}`, { signal })
+  const res = await apiFetch(`${path}`, { signal })
   if (!res.ok) {
     const body = await res.json().catch(() => ({}))
     throw new Error(body.error || `Request failed (${res.status})`)
@@ -114,7 +136,7 @@ export async function fetchSegment(phone, { signal } = {}) {
 
 /** The pre-call brief: what to know, and what to ask. */
 export async function fetchBrief(customer, { signal } = {}) {
-  const res = await fetch(`${API_BASE}/api/ai/brief`, {
+  const res = await apiFetch(`/api/ai/brief`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ customer }),

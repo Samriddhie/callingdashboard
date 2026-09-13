@@ -1,4 +1,4 @@
-import { API_BASE } from './api.js'
+import { apiFetch } from './api.js'
 
 /**
  * Note → structured fields, two ways:
@@ -22,7 +22,7 @@ export async function extractFromNoteAI(rawText, context = {}) {
   const text = (rawText || '').trim()
   if (!text) return []
 
-  const res = await fetch(`${API_BASE}/api/extract`, {
+  const res = await apiFetch('/api/extract', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({

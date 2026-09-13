@@ -1,84 +1,112 @@
-import React, { createContext, useContext, useEffect, useMemo, useState } from 'react'
-import { loadSession, saveSession } from '../data/storage.js'
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import { useData } from '../data/DataContext.jsx'
-import { API_BASE } from '../data/api.js'
+import { UNAUTHORIZED_EVENT, apiFetch } from '../data/api.js'
 
 /**
  * Identity layer. Every call records `initiatedBy`, so the attribution question
  * ("who actually made this call?") is answered by data, not by memory.
  *
- * Google Sign-In: LoginScreen gets an ID token straight from Google, then
- * `signInWithGoogle()` sends it to the backend (`POST /api/auth/google`),
- * which checks Google's signature on it and the @domain allow-list before
- * this app trusts it. A token the browser hands us is a claim, not proof —
- * that verification step is why this can't just be client-side.
+ * The session is owned by the backend. Signing in — with Google, or the local
+ * development sign-in — makes the server set an HttpOnly cookie that page code
+ * cannot read or forge, and every /api request carries it. Nothing about the
+ * session is kept in localStorage: on load we ask the server who is signed in
+ * (`GET /api/auth/me`) instead of trusting anything the browser remembers.
  *
- * Honest limitation: the data itself still lives in this browser's
- * localStorage. Google Sign-In proves *who* is at the keyboard; it does not
- * make the phone numbers on this machine secure, and two employees on two
- * machines still get two separate datasets. Shared history needs the app's
- * data to move to a real database, which is a separate project from auth.
+ * A local `users[]` record still exists per person, because calls and notes
+ * are stamped with a user id. It is matched to the signed-in person by email,
+ * or by name when the development sign-in was used without one.
  */
 
 const AuthContext = createContext(null)
 
+async function postJson(path, body) {
+  const res = await apiFetch(path, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body || {}),
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`)
+  return data
+}
+
+function sameIdentity(user, person) {
+  const email = (person.email || '').toLowerCase()
+  if (email) return (user.email || '').toLowerCase() === email
+  return !user.email && user.name === person.name
+}
+
 export function AuthProvider({ children }) {
   const { users, addUser } = useData()
-  const [userId, setUserId] = useState(loadSession)
+  // Who the server says is signed in — { name, email } — or null.
+  const [person, setPerson] = useState(null)
+  const [checked, setChecked] = useState(false)
 
+  // Once, on load: does this browser already hold a valid session?
   useEffect(() => {
-    saveSession(userId)
-  }, [userId])
+    let cancelled = false
+    apiFetch('/api/auth/me')
+      .then((res) => (res.ok ? res.json() : null))
+      .catch(() => null)
+      .then((me) => {
+        if (cancelled) return
+        setPerson(me)
+        setChecked(true)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
-  const user = users.find((u) => u.id === userId) || null
-
-  // A stored session pointing at a deleted user shouldn't wedge the app.
+  // A 401 from any request means the session ended underneath us.
   useEffect(() => {
-    if (userId && !user) setUserId(null)
-  }, [userId, user])
+    const onUnauthorized = () => setPerson(null)
+    window.addEventListener(UNAUTHORIZED_EVENT, onUnauthorized)
+    return () => window.removeEventListener(UNAUTHORIZED_EVENT, onUnauthorized)
+  }, [])
+
+  const user = useMemo(
+    () => (person ? users.find((u) => sameIdentity(u, person)) || null : null),
+    [person, users]
+  )
+
+  // First sign-in on this browser: create the local record calls are stamped
+  // with. The ref stops StrictMode's double effect run from creating two.
+  const created = useRef(new Set())
+  useEffect(() => {
+    if (!person || user) return
+    const key = `${person.email || ''}|${person.name || ''}`.toLowerCase()
+    if (created.current.has(key)) return
+    created.current.add(key)
+    addUser({ name: person.name, email: person.email })
+  }, [person, user, addUser])
+
+  const signInWithGoogle = useCallback(async (credential) => {
+    const me = await postJson('/api/auth/google', { credential })
+    setPerson({ name: me.name, email: me.email })
+    return me
+  }, [])
+
+  const signInDev = useCallback(async ({ name, email }) => {
+    const me = await postJson('/api/auth/dev', { name, email })
+    setPerson(me)
+    return me
+  }, [])
+
+  const signOut = useCallback(async () => {
+    // Clear locally even if the server can't be reached; the cookie expires anyway.
+    await apiFetch('/api/auth/logout', { method: 'POST' }).catch(() => {})
+    setPerson(null)
+  }, [])
+
+  // "checking" covers the first round-trip and the one render between a
+  // sign-in and its local user record existing, so nobody already signed in
+  // sees the sign-in screen flash past.
+  const status = !checked || (person && !user) ? 'checking' : user ? 'signedIn' : 'signedOut'
 
   const value = useMemo(
-    () => ({
-      user,
-      users,
-      signIn: (id) => setUserId(id),
-      signInAsNew: (input) => {
-        const created = addUser(input)
-        setUserId(created.id)
-        return created
-      },
-      // Takes the ID token from Google's callback (see LoginScreen), not a
-      // user object — the backend is the only thing allowed to decide whose
-      // email that token actually belongs to.
-      signInWithGoogle: async (credential) => {
-        const res = await fetch(`${API_BASE}/api/auth/google`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ credential }),
-        })
-
-        if (!res.ok) {
-          const body = await res.json().catch(() => ({}))
-          throw new Error(body.error || 'Google sign-in failed.')
-        }
-
-        const profile = await res.json()
-        const existing = users.find(
-          (u) => u.email && u.email.toLowerCase() === profile.email.toLowerCase()
-        )
-
-        if (existing) {
-          setUserId(existing.id)
-          return existing
-        }
-
-        const created = addUser({ name: profile.name, email: profile.email })
-        setUserId(created.id)
-        return created
-      },
-      signOut: () => setUserId(null),
-    }),
-    [user, users, addUser]
+    () => ({ user, users, status, signInWithGoogle, signInDev, signOut }),
+    [user, users, status, signInWithGoogle, signInDev, signOut]
   )
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>

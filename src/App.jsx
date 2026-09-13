@@ -13,7 +13,7 @@ import { useAuth } from './auth/AuthContext.jsx'
 
 export default function App() {
   const { customers, cats, tickets } = useData()
-  const { user } = useAuth()
+  const { user, status } = useAuth()
 
   const [page, setPage] = useState('dashboard')
   // The detail view takes over the content area while `page` stays put, so Back
@@ -26,6 +26,14 @@ export default function App() {
     () => (callTarget ? cats.filter((c) => c.customerId === callTarget.id) : []),
     [cats, callTarget]
   )
+
+  if (status === 'checking') {
+    return (
+      <div className="flex h-full items-center justify-center bg-canvas text-sm text-gray-400">
+        Checking your sign-in…
+      </div>
+    )
+  }
 
   // Nothing is reachable without an identity — every call has to be attributable.
   if (!user) return <LoginScreen />

@@ -2,7 +2,6 @@ import { EMPTY_DB, SCHEMA_VERSION, makeCat, makeOrder, newId } from './schema.js
 
 export const STORAGE_KEY = 'calldesk.data.v2'
 export const LEGACY_KEY = 'calldesk.data.v1'
-export const SESSION_KEY = 'calldesk.session'
 
 const COLLECTIONS = [
   'users',
@@ -130,22 +129,5 @@ export function saveDb(db) {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(db))
   } catch (err) {
     console.error('Could not save data.', err)
-  }
-}
-
-export function loadSession() {
-  try {
-    return localStorage.getItem(SESSION_KEY) || null
-  } catch {
-    return null
-  }
-}
-
-export function saveSession(userId) {
-  try {
-    if (userId) localStorage.setItem(SESSION_KEY, userId)
-    else localStorage.removeItem(SESSION_KEY)
-  } catch {
-    /* ignore */
   }
 }

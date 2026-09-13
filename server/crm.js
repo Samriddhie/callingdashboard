@@ -15,26 +15,29 @@ import pg from 'pg'
 
 const CONFIGURED = Boolean(process.env.CRM_DATABASE || process.env.CRM_DATABASE_URL)
 
+// Sent as a startup option, so a connection is read-only from the moment it
+// opens. The earlier `SET` after connecting raced the first query on a fresh
+// connection: that query could run before the guard was in place (and pg
+// warned about it as a query issued while another was still running).
+const READ_ONLY = '-c default_transaction_read_only=on'
+
 const pool = CONFIGURED
   ? new pg.Pool(
       process.env.CRM_DATABASE_URL
-        ? { connectionString: process.env.CRM_DATABASE_URL, max: 4 }
+        ? { connectionString: process.env.CRM_DATABASE_URL, options: READ_ONLY, max: 4 }
         : {
             host: process.env.CRM_HOST || 'localhost',
             port: Number(process.env.CRM_PORT || 5432),
             database: process.env.CRM_DATABASE,
             user: process.env.CRM_USER || undefined,
             password: process.env.CRM_PASSWORD || undefined,
+            options: READ_ONLY,
             max: 4,
           }
     )
   : null
 
 if (pool) {
-  // Belt and braces: any connection this pool hands out cannot write.
-  pool.on('connect', (client) => {
-    client.query('SET default_transaction_read_only = on').catch(() => {})
-  })
   pool.on('error', (err) => console.error('CRM pool error:', err.message))
 }
 

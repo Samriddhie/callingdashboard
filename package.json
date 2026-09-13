@@ -6,9 +6,19 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "build:all": "npm install --prefix server && vite build",
+    "start": "node server/index.js"
+  },
+  "engines": {
+    "node": ">=20"
   },
   "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^16.6.1",
+    "express": "^4.22.2",
+    "google-auth-library": "^9.15.1",
+    "pg": "^8.23.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0"
   },
