@@ -30,6 +30,11 @@ const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || ''
 const ALLOWED_EMAIL_DOMAIN = (process.env.ALLOWED_EMAIL_DOMAIN || '').toLowerCase().trim()
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || ''
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001'
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || ''
+const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'anthropic/claude-3.5-sonnet'
+// Overridable so the endpoint can be pointed at a stub in tests, or at a
+// proxy. Defaults to OpenRouter itself.
+const OPENROUTER_BASE_URL = process.env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1'
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'http://localhost:5173'
 
 // Vercel loads this file as a function per request (api/index.js) rather than
@@ -78,6 +83,7 @@ app.get('/api/health', (req, res) => {
     ok: true,
     googleConfigured: Boolean(GOOGLE_CLIENT_ID),
     anthropicConfigured: Boolean(ANTHROPIC_API_KEY),
+    openrouterConfigured: Boolean(OPENROUTER_API_KEY),
     // The frontend builds admin.shopify.com links from this; without it there
     // is no way to know which store an id belongs to.
     shopifyStore: process.env.SHOPIFY_STORE || null,
@@ -380,6 +386,151 @@ app.post('/api/extract', async (req, res) => {
   } catch (err) {
     console.error('Extraction request failed:', err)
     res.status(500).json({ error: 'AI extraction request failed.' })
+  }
+})
+
+/* ------------------------------------------------------------------ */
+/* Note extraction via OpenRouter                                      */
+/*                                                                      */
+/* A flat, household-level view of a note, separate from /api/extract   */
+/* above: that one returns per-field rows keyed to what the customer    */
+/* page renders, this one returns one object with a fixed shape.        */
+/*                                                                      */
+/* requireAuth is already applied to everything under /api, but it is   */
+/* named here too so the route reads as protected on its own.           */
+/* ------------------------------------------------------------------ */
+
+// Every key the model may return, and what it should hold. Anything else it
+// volunteers is dropped, and anything it omits comes back empty rather than
+// missing, so the caller always gets the same shape.
+const NOTE_FIELDS = {
+  cat_names: { type: 'array', hint: "each cat's name, one per entry" },
+  cat_breeds: { type: 'array', hint: 'breeds mentioned, as the customer said them' },
+  health_issues: { type: 'array', hint: 'illnesses, allergies, diets or vet issues' },
+  food_type: { type: 'string', hint: 'dry, wet, home made, treats, or a mix' },
+  feeding_schedule: { type: 'string', hint: 'what they feed and how often' },
+  brand_preferences: { type: 'array', hint: 'cat food brands they buy or mention' },
+  purchase_location: { type: 'string', hint: 'where they buy, e.g. Amazon or a local shop' },
+  family_info: { type: 'string', hint: 'who is in the household and who feeds the cats' },
+}
+
+const NOTE_SYSTEM_PROMPT = `You read notes taken during a phone call with a cat owner in India and return what the note actually says, as JSON.
+
+Return one JSON object with exactly these keys:
+${Object.entries(NOTE_FIELDS)
+  .map(([key, { type, hint }]) => `- ${key} (${type === 'array' ? 'array of strings' : 'string'}): ${hint}`)
+  .join('\n')}
+
+Rules:
+- Use only what the note supports. Never guess, infer or fill a gap.
+- Nothing said about a key: empty array for arrays, empty string for strings.
+- Keep the customer's own words where you can; do not tidy them into marketing language.
+- Output nothing but the JSON object, starting with { and ending with }.`
+
+// A note longer than this is not a call note, and sending it would cost money
+// for nothing.
+const MAX_NOTE_CHARS = 20000
+// Serverless functions are killed at a timeout of their own; failing first
+// with a clear message beats being cut off mid-request.
+const OPENROUTER_TIMEOUT_MS = Number(process.env.OPENROUTER_TIMEOUT_MS || 30000)
+
+/** Force the model's answer into the shape above, whatever it returned. */
+function normaliseNoteFields(parsed) {
+  const out = {}
+  for (const [key, { type }] of Object.entries(NOTE_FIELDS)) {
+    const value = parsed?.[key]
+    if (type === 'array') {
+      out[key] = Array.isArray(value)
+        ? value.map((entry) => String(entry).trim()).filter(Boolean)
+        : String(value || '')
+            .split(',')
+            .map((entry) => entry.trim())
+            .filter(Boolean)
+    } else {
+      out[key] = value == null ? '' : String(value).trim()
+    }
+  }
+  return out
+}
+
+app.post('/api/extract-notes', requireAuth, async (req, res) => {
+  const notes = typeof req.body?.notes === 'string' ? req.body.notes.trim() : ''
+
+  if (!notes) {
+    return res.status(400).json({ error: 'notes is required and cannot be empty.' })
+  }
+  if (notes.length > MAX_NOTE_CHARS) {
+    return res
+      .status(413)
+      .json({ error: `notes is too long (${notes.length} characters, limit ${MAX_NOTE_CHARS}).` })
+  }
+  if (!OPENROUTER_API_KEY) {
+    return res
+      .status(503)
+      .json({ error: 'Server is missing OPENROUTER_API_KEY — see server/.env.example' })
+  }
+
+  const abort = new AbortController()
+  const timer = setTimeout(() => abort.abort(), OPENROUTER_TIMEOUT_MS)
+
+  try {
+    const r = await fetch(`${OPENROUTER_BASE_URL}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${OPENROUTER_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: OPENROUTER_MODEL,
+        temperature: 0,
+        max_tokens: 900,
+        response_format: { type: 'json_object' },
+        messages: [
+          { role: 'system', content: NOTE_SYSTEM_PROMPT },
+          { role: 'user', content: notes },
+        ],
+      }),
+      signal: abort.signal,
+    })
+
+    if (!r.ok) {
+      // The body can carry the key in an error echo, so it is logged, never returned.
+      console.error('OpenRouter API error:', r.status, await r.text())
+      return res.status(502).json({ error: 'Note extraction service failed.' })
+    }
+
+    const data = await r.json()
+    const raw = (data?.choices?.[0]?.message?.content || '').trim()
+    if (!raw) {
+      console.error('OpenRouter returned no content:', JSON.stringify(data).slice(0, 500))
+      return res.status(502).json({ error: 'Note extraction returned an empty response.' })
+    }
+
+    // Models still fence JSON in markdown even when asked not to.
+    const jsonText = raw.replace(/^```(?:json)?/i, '').replace(/```$/, '').trim()
+
+    let parsed
+    try {
+      parsed = JSON.parse(jsonText)
+    } catch {
+      console.error('Could not parse OpenRouter output as JSON:', jsonText.slice(0, 500))
+      return res.status(502).json({ error: 'Note extraction returned an unreadable response.' })
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      console.error('OpenRouter returned JSON that is not an object:', jsonText.slice(0, 500))
+      return res.status(502).json({ error: 'Note extraction returned an unexpected shape.' })
+    }
+
+    res.json({ model: OPENROUTER_MODEL, fields: normaliseNoteFields(parsed) })
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      console.error('OpenRouter request timed out after', OPENROUTER_TIMEOUT_MS, 'ms')
+      return res.status(504).json({ error: 'Note extraction timed out.' })
+    }
+    console.error('Note extraction request failed:', err)
+    res.status(500).json({ error: 'Note extraction request failed.' })
+  } finally {
+    clearTimeout(timer)
   }
 })
 
